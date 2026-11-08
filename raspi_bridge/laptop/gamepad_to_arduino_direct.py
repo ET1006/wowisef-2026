@@ -48,7 +48,13 @@ import serial.tools.list_ports
 
 # ---------------------------- Configuration (preserved) ----------------------------
 BAUD_RATE = 115200  # Matches arduino_bridge.ino setup() -> Serial.begin(115200)
-SEND_RATE = 30      # 30 Hz drive stream (~33.3 ms per frame)
+SEND_RATE = 25      # 25 Hz drive stream (~40 ms per frame) -- slower than
+                       # 30 Hz gives macOS's USB CDC driver enough headroom
+                       # to deliver each 22-byte payload in a single USB
+                       # transaction. At 30 Hz some writes get split
+                       # mid-line, which the ESP's readStringUntil('\n')
+                       # then sees as "0,FORW" + "ARD,..." and rejects
+                       # the first fragment as malformed CSV.
 HOLD_FRAMES = 1     # ~100 ms button-pulse hold (matches prelim-ver script)
 
 # Per-sensor in-band window. The script auto-sends WARN:<sensor> when a TOF
@@ -245,6 +251,7 @@ class SerialReader(threading.Thread):
         self._ser = ser
         self._state = state
         self._stop = threading.Event()
+        self._line_count = 0
 
     def stop(self) -> None:
         self._stop.set()
@@ -260,6 +267,12 @@ class SerialReader(threading.Thread):
                 break
             if not raw:
                 continue
+            self._line_count += 1
+            if self._line_count <= 3:
+                # Diagnostic: print the first few raw lines so we can
+                # confirm the read path is alive and what the chip is
+                # actually sending (incl. any boot-time banners).
+                print(f"\n[serial:raw #{self._line_count}] {raw!r}", flush=True)
             try:
                 line = raw.decode("utf-8", errors="replace")
             except Exception as e:
@@ -327,6 +340,7 @@ def stream_loop(ser: serial.Serial | None,
     active_command = "NONE"
     hold_counter = 0
     last_warned: dict = {"up": False, "down": False}
+    _write_count = 0
     last_tof_up = -1
     last_tof_down = -1
 
@@ -338,7 +352,16 @@ def stream_loop(ser: serial.Serial | None,
     try:
         while True:
             if controller_mode:
+                # SDL2 controller state in pygame 2.6 is NOT refreshed by
+                # event.pump() alone -- we must call pad.update() to pull
+                # the latest snapshot from the SDL2 gamepad buffer. Without
+                # this, get_axis()/get_button() return stale (zero) values
+                # no matter how hard you press.
                 pygame.event.pump()
+                try:
+                    pad.update()
+                except Exception:
+                    pass
                 channels = get_21_channels(pad)
             else:
                 # Test mode without controller: zeroed channels. Allows the
@@ -422,7 +445,22 @@ def stream_loop(ser: serial.Serial | None,
                 command_out = "NONE"
             payload = f"{drive_speed},{drive_direction},{command_out},{altitude_mode}\n"
             if ser is not None:
-                ser.write(payload.encode("utf-8"))
+                # Print the literal payload (repr) and flush+reset_input_buffer
+                # so pyserial doesn't smear a write across two readStringUntil
+                # windows on the ESP side -- which is the classic way the
+                # chip sees "0,FORW" then "ARD,NONE,manual\n" and rejects the
+                # first fragment as malformed CSV.
+                _sent = payload.encode("utf-8")
+                if _write_count < 5:
+                    print(f"\n[serial:tx #{_write_count + 1}] {_sent!r}", flush=True)
+                _write_count += 1
+                ser.write(_sent)
+                ser.flush()
+                # 5 ms gap so macOS's USB CDC driver finishes the current
+                # transaction before we queue the next one. Without this
+                # the OS can split a 22-byte payload across two USB
+                # transactions, which the ESP then reads as two fragments.
+                time.sleep(0.005)
 
             # --- 7. Operator-visible status line ---
             tof_up_disp   = _format_tof(state.tof_up, state.tof_enabled)
@@ -493,7 +531,9 @@ def main():
     ser = None
 
     if not test_mode:
+        print("[main] calling find_arduino_port()...", flush=True)
         port_name = args.port or find_arduino_port()
+        print(f"[main] auto-detected port_name = {port_name!r}", flush=True)
         if not port_name:
             print("⚠️  Could not auto-detect Arduino.")
             user_choice = input("Run in Test Mode without Arduino? (y/n): ").strip().lower()
@@ -503,8 +543,50 @@ def main():
                 port_name = input("Enter custom serial port path: ").strip()
         if not test_mode:
             try:
-                ser = serial.Serial(port_name, args.baud, timeout=0.5)
+                print(f"[main] calling serial.Serial({port_name!r}, {args.baud}, timeout=2)...", flush=True)
+                # The timeout= here only governs read(); on macOS the open()
+                # call itself can block if the CDC driver is wedged. We give
+                # it a watchdog thread so we don't hang the whole script.
+                open_done = threading.Event()
+                open_error: Exception | None = None
+                def _open():
+                    nonlocal ser, open_error
+                    try:
+                        ser = serial.Serial(
+                            port_name, args.baud, timeout=0.5,
+                            rtscts=False, dsrdtr=False,
+                        )
+                        # CRITICAL: prevent pyserial from holding RTS/DTR
+                        # high, which on ESP32 dev boards with a DTR->EN
+                        # circuit resets the chip into the bootloader. The
+                        # bootloader emits no telemetry, so the read path
+                        # looks dead even though the firmware is fine.
+                        # Modern pyserial moved these out of the
+                        # constructor and into post-init attributes.
+                        ser.rts = False
+                        ser.dtr = False
+                    except Exception as e:
+                        open_error = e
+                    finally:
+                        open_done.set()
+                t = threading.Thread(target=_open, daemon=True)
+                t.start()
+                if not open_done.wait(timeout=5.0):
+                    print(f"[main] serial.Serial() open() did not return within 5s. The port is wedged.", flush=True)
+                    print(f"[main] Likely cause: macOS CDC driver or another process is holding {port_name}.", flush=True)
+                    print(f"[main] Try:  lsof | grep {port_name.split('/')[-1]}", flush=True)
+                    print(f"[main] Try:  Unplug the Arduino, wait 3s, replug, and re-run.", flush=True)
+                    sys.exit(1)
+                t.join()
+                if open_error is not None:
+                    print(f"❌ Serial connection failed: {open_error}")
+                    sys.exit(1)
+                if ser is None:
+                    print("❌ Serial connection failed: serial.Serial() returned None without raising.")
+                    sys.exit(1)
+                print(f"[main] serial.Serial() returned: {ser}", flush=True)
                 time.sleep(2)
+                print(f"[main] after 2s settle sleep, ser.is_open={ser.is_open}", flush=True)
                 print(f"🔌 Connected to Arduino on {port_name} @ {args.baud} baud")
             except Exception as e:
                 print(f"❌ Serial connection failed: {e}")
@@ -516,12 +598,22 @@ def main():
 
     pad = None
     controller_mode = False
+    print("[main] before pygame.init()", flush=True)
     pygame.init()
+    print("[main] after pygame.init()", flush=True)
     controller.init()
-    for i in range(controller.get_count()):
-        if controller.is_controller(i):
+    print("[main] after controller.init()", flush=True)
+    n = controller.get_count()
+    print(f"[main] controller.get_count() = {n}", flush=True)
+    for i in range(n):
+        is_c = controller.is_controller(i)
+        print(f"[main] index {i}: is_controller={is_c}", flush=True)
+        if is_c:
+            print(f"[main] index {i}: creating Controller object...", flush=True)
             pad = controller.Controller(i)
+            print(f"[main] index {i}: calling pad.init() (this can hang on macOS)...", flush=True)
             pad.init()
+            print(f"[main] index {i}: pad.init() returned", flush=True)
             controller_mode = True
             print(f"🎮 Connected Controller: {pad.name}")
             break
